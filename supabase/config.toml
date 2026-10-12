@@ -1,0 +1,11 @@
+[functions.agent-step]
+verify_jwt = true
+entrypoint = "./functions/agent-step/index.ts"
+
+[functions.jev-grade]
+verify_jwt = true
+entrypoint = "./functions/jev-grade/index.ts"
+
+[functions.bench-api]
+verify_jwt = true
+entrypoint = "./functions/bench-api/index.ts"
