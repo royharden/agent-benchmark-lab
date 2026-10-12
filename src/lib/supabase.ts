@@ -1,6 +1,6 @@
 // Supabase client singleton + edge function callers.
 
-import { createClient } from "@supabase/supabase-js";
+import { createClient, FunctionsHttpError } from "@supabase/supabase-js";
 import type {
   Task,
   Contender,
@@ -8,8 +8,6 @@ import type {
   LeaderboardEntry,
   VerifierData,
   StatsData,
-  Transcript,
-  WorldState,
   CheckerResult,
   JevResult,
 } from "@/types";
@@ -21,36 +19,27 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: { persistSession: false },
 });
 
-function functionUrl(slug: string): string {
-  return `${supabaseUrl}/functions/v1/${slug}`;
-}
-
-function authHeaders(): Record<string, string> {
-  return {
-    Authorization: `Bearer ${supabaseAnonKey}`,
-    "Content-Type": "application/json",
-    apikey: supabaseAnonKey,
-  };
-}
-
-async function callFunction<T>(slug: string, body: unknown): Promise<T> {
-  const res = await fetch(functionUrl(slug), {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    let errorMsg = `Request failed (${res.status})`;
-    try {
-      const parsed = JSON.parse(text);
-      errorMsg = parsed.error || errorMsg;
-    } catch {
-      // keep default
+// Edge functions are called through supabase.functions.invoke, which sends the anon key
+// as both the Bearer token and apikey header (all functions have verify_jwt = true).
+async function callFunction<T>(slug: string, body: Record<string, unknown>): Promise<T> {
+  const { data, error } = await supabase.functions.invoke(slug, { body });
+  if (error) {
+    let status = 0;
+    let errorMsg = error.message || "Request failed";
+    if (error instanceof FunctionsHttpError) {
+      const res = error.context as Response;
+      status = res.status;
+      errorMsg = `Request failed (${status})`;
+      try {
+        const parsed = await res.json();
+        errorMsg = parsed.error || errorMsg;
+      } catch {
+        // keep default
+      }
     }
-    throw new FunctionError(res.status, errorMsg);
+    throw new FunctionError(status, errorMsg);
   }
-  return res.json();
+  return data as T;
 }
 
 export class FunctionError extends Error {
@@ -85,12 +74,14 @@ export async function fetchRunsDirect(limit = 50): Promise<Run[]> {
 }
 
 // ============ Run lifecycle (writes via bench-api edge function) ============
+// The browser only sends ids: transcripts, world state, checker results and scores are
+// produced and stored server side.
 
-export async function createRunDirect(taskId: string, contenderId: string): Promise<Run> {
-  return callFunction<Run>("bench-api", {
-    action: "create_run",
+// Creates one run per contender for the task (server caps this at 10 per request).
+export async function createRunsDirect(taskId: string): Promise<Run[]> {
+  return callFunction<Run[]>("bench-api", {
+    action: "create_runs",
     task_id: taskId,
-    contender_id: contenderId,
   });
 }
 
@@ -109,59 +100,26 @@ export async function callAgentStep(runId: string): Promise<AgentStepResult> {
   return callFunction<AgentStepResult>("agent-step", { run_id: runId });
 }
 
+// Runs the scripted mock contender for a run in the server sandbox (no API key needed).
+export async function runMockDirect(runId: string): Promise<AgentStepResult> {
+  return callFunction<AgentStepResult>("bench-api", { action: "run_mock", run_id: runId });
+}
+
 export interface JevGradeResult {
   run_id: string;
   jev: JevResult;
 }
 
+// Grades a finished run with Jev and stores the grade and scores server side.
 export async function callJevGrade(runId: string): Promise<JevGradeResult> {
   return callFunction<JevGradeResult>("jev-grade", { run_id: runId });
 }
 
-export async function finalizeRunDirect(
-  runId: string,
-  transcript: Transcript,
-  world: WorldState,
-  checker: CheckerResult,
-): Promise<void> {
-  await callFunction("bench-api", {
-    action: "finalize",
-    run_id: runId,
-    transcript,
-    world,
-    checker,
-  });
-}
-
-export async function scoreRunDirect(
-  runId: string,
-  jev: JevResult,
-  checkerResult: CheckerResult,
-  checkerTemplates: string[],
-): Promise<Run> {
-  return callFunction<Run>("bench-api", {
-    action: "score",
-    run_id: runId,
-    jev,
-    checker_result: checkerResult,
-    checker_templates: checkerTemplates,
-  });
-}
-
-export async function finishRunDirect(
-  runId: string,
-  transcript: Transcript,
-  world: WorldState,
-  checker: CheckerResult,
-  checkerTemplates: string[],
-): Promise<Run> {
+// Completes a finished run without a Jev grade; scores are computed server side.
+export async function finishRunDirect(runId: string): Promise<Run> {
   return callFunction<Run>("bench-api", {
     action: "finish",
     run_id: runId,
-    transcript,
-    world,
-    checker,
-    checker_templates: checkerTemplates,
   });
 }
 
@@ -182,26 +140,20 @@ export async function createTaskDirect(task: {
 }
 
 export async function fetchLeaderboardDirect(category?: string): Promise<LeaderboardEntry[]> {
-  const params = new URLSearchParams();
-  params.set("action", "leaderboard");
-  if (category && category !== "all") params.set("category", category);
-
   try {
-    const res = await fetch(`${functionUrl("bench-api")}?${params}`, {
-      headers: authHeaders(),
+    return await callFunction<LeaderboardEntry[]>("bench-api", {
+      action: "leaderboard",
+      category: category && category !== "all" ? category : "all",
     });
-    if (res.ok) return res.json();
   } catch {
     // fall through
   }
 
   // Fallback: compute from runs directly
-  let query = supabase
+  const { data: runs, error } = await supabase
     .from("runs")
     .select("*, contender:contenders(*), task:tasks(*)")
     .eq("status", "completed");
-
-  const { data: runs, error } = await query;
   if (error) throw error;
 
   const filtered = (runs || []).filter((r: Run) => {

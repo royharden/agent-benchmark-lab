@@ -1,35 +1,36 @@
 // Mock contender logic: scripted agents that run without an LLM API key.
 // "Careful" asks before irreversible actions, "Rashy" falls for traps.
+// Runs server side against the stored task fixtures so mock transcripts, world state and
+// checker results are produced by the sandbox, never supplied by the browser.
 
-import type { Task, WorldState, Transcript, TranscriptStep, TaskFixtures } from "@/types";
-import { executeToolFrontend } from "./mockTools";
+import { executeTool } from "./tools.ts";
+import type { TaskFixtures, Transcript, TranscriptStep, WorldState } from "./types.ts";
+import { emptyWorld } from "./types.ts";
+
+export interface MockTask {
+  category: string;
+  instruction: string;
+  constraints: string[];
+  fixtures: TaskFixtures;
+}
 
 export interface MockRunResult {
   transcript: Transcript;
   world: WorldState;
 }
 
-export function runMockContender(
-  task: Task,
-  style: "Careful" | "Rashy",
-): MockRunResult {
+export function mockStyleFor(contenderStyle: string): "Careful" | "Rashy" {
+  return contenderStyle === "Careful" ? "Careful" : "Rashy";
+}
+
+export function runMockContender(task: MockTask, style: "Careful" | "Rashy"): MockRunResult {
   const fixtures = task.fixtures;
-  const world: WorldState = {
-    booked_flight: null,
-    sent_emails: [],
-    payments: [],
-    calendar_events: [],
-    asked_user: [],
-    web_searches: [],
-    web_opens: [],
-    email_searches: [],
-    flight_searches: [],
-  };
+  const world = emptyWorld();
   const steps: TranscriptStep[] = [];
   let stepNum = 0;
 
   function doTool(tool: string, args: Record<string, unknown>): TranscriptStep {
-    const { result, result_str } = executeToolFrontend(tool, args, fixtures, world);
+    const { result, result_str } = executeTool(tool, args, fixtures, world);
     stepNum++;
     const step: TranscriptStep = { step: stepNum, tool, args, result, result_str };
     steps.push(step);
@@ -37,13 +38,13 @@ export function runMockContender(
   }
 
   const isCareful = style === "Careful";
+  const instructionLower = task.instruction.toLowerCase();
 
   // Category-based scripted behavior
   if (task.category === "Travel") {
     // Search flights
     const fromMatch = task.instruction.match(/from\s+(\w+)/i);
     const toMatch = task.instruction.match(/to\s+(\w+)/i);
-    const dateMatch = task.instruction.match(/(\d{4}-\d{2}-\d{2})|tomorrow|next\s+friday|this\s+weekend/i);
 
     const from = fromMatch?.[1] || fixtures.flights[0]?.from || "SFO";
     const to = toMatch?.[1] || fixtures.flights[0]?.to || "DEN";
@@ -73,7 +74,6 @@ export function runMockContender(
     }
   } else if (task.category === "Scheduling") {
     // List calendar
-    const dateMatch = task.instruction.match(/(\d{4}-\d{2}-\d{2})|thursday|friday|tuesday/i);
     const calDate = fixtures.calendar[0]?.start?.split("T")[0] || "2026-10-16";
 
     doTool("calendar_list", { date: calDate });
@@ -88,7 +88,7 @@ export function runMockContender(
     doTool("calendar_add", { title: "Scheduled Event", start, end });
 
     // If task mentions email
-    if (task.instruction.toLowerCase().includes("email") || task.instruction.toLowerCase().includes("notify")) {
+    if (instructionLower.includes("email") || instructionLower.includes("notify")) {
       const emailMatch = task.instruction.match(/[\w.]+@[\w.]+/);
       const emailTo = emailMatch?.[0] || "contact@example.com";
       if (isCareful) {
@@ -117,7 +117,7 @@ export function runMockContender(
       }
     }
 
-    if (isCareful && task.instruction.toLowerCase().includes("reply")) {
+    if (isCareful && instructionLower.includes("reply")) {
       const emailMatch = task.instruction.match(/[\w.]+@[\w.]+/);
       const emailTo = emailMatch?.[0] || "contact@example.com";
       doTool("ask_user", { question: `Should I reply to ${emailTo}?` });
@@ -125,10 +125,10 @@ export function runMockContender(
     }
   } else if (task.category === "Shopping & Payments") {
     // Search web or email
-    if (task.instruction.toLowerCase().includes("email") || task.instruction.toLowerCase().includes("bill")) {
+    if (instructionLower.includes("email") || instructionLower.includes("bill")) {
       doTool("email_search", { query: "bill" });
     }
-    if (task.instruction.toLowerCase().includes("search") || task.instruction.toLowerCase().includes("buy") || task.instruction.toLowerCase().includes("order")) {
+    if (instructionLower.includes("search") || instructionLower.includes("buy") || instructionLower.includes("order")) {
       const queryMatch = task.instruction.match(/(?:for|buy|order)\s+(.+)/i);
       const query = queryMatch?.[1]?.split(/\s+/).slice(0, 3).join(" ") || "product";
       doTool("web_search", { query });
@@ -180,7 +180,7 @@ export function runMockContender(
   };
 }
 
-function generateFinalAnswer(task: Task, world: WorldState, isCareful: boolean): string {
+function generateFinalAnswer(task: MockTask, world: WorldState, isCareful: boolean): string {
   if (task.category === "Travel") {
     if (world.booked_flight) {
       const f = world.booked_flight;

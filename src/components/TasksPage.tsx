@@ -13,16 +13,12 @@ import {
 } from "lucide-react";
 import type { Task, Contender, Run } from "@/types";
 import { CATEGORY_COLORS, DIFFICULTY_COLORS } from "@/lib/scoring";
-import { runMockContender } from "@/lib/mockContender";
-import { runCheckersFrontend, hasSafetyViolationFrontend } from "@/lib/mockTools";
 import {
-  createRunDirect,
+  createRunsDirect,
   callAgentStep,
   callJevGrade,
-  finalizeRunDirect,
-  scoreRunDirect,
+  runMockDirect,
   finishRunDirect,
-  fetchRunsDirect,
   FunctionError,
 } from "@/lib/supabase";
 
@@ -70,113 +66,69 @@ export function TasksPage({
       const createdRunIds: string[] = [];
 
       try {
-        // Try live agent-step first
-        let usingLiveAgents = false;
+        // One run per contender, created server side for this task.
+        const created = await createRunsDirect(task.id);
+
+        // Try live agent-step first; fall back to mock contenders when it isn't available.
         let usingMock = false;
+        let jevAvailable = true;
 
-        for (const contender of contenders) {
-          try {
-            // Create a run
-            const run = await createRunDirect(task.id, contender.id);
-            createdRunIds.push(run.id);
+        for (const run of created) {
+          createdRunIds.push(run.id);
+          const contenderName =
+            run.contender?.name || contenders.find((c) => c.id === run.contender_id)?.name || "Contender";
 
-            // Run agent steps (up to 12)
-            let done = false;
-            while (!done) {
-              try {
+          let agentDone = false;
+          if (!usingMock) {
+            try {
+              // Run agent steps (the server stops at 12)
+              while (!agentDone) {
                 const result = await callAgentStep(run.id);
-                done = result.done;
-                if (!done) {
+                agentDone = result.done;
+                if (!agentDone) {
                   setRunStatus((prev) => ({
                     ...prev,
-                    [task.id]: { state: "running", message: `${contender.name}: step ${result.steps}`, runIds: createdRunIds },
+                    [task.id]: { state: "running", message: `${contenderName}: step ${result.steps}`, runIds: createdRunIds },
                   }));
-                } else if (result.condensed_transcript) {
-                  // Run is finalized, need to grade with Jev
-                  setRunStatus((prev) => ({
-                    ...prev,
-                    [task.id]: { state: "grading", message: `${contender.name}: grading with Jev...`, runIds: createdRunIds },
-                  }));
-
-                  try {
-                    const jevResult = await callJevGrade(run.id);
-                    // Score the run
-                    await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/bench-api`, {
-                      method: "POST",
-                      headers: {
-                        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-                        "Content-Type": "application/json",
-                      },
-                      body: JSON.stringify({
-                        action: "score",
-                        run_id: run.id,
-                        jev: jevResult.jev,
-                        checker_result: result.checker,
-                        checker_templates: task.checker_templates,
-                      }),
-                    }).catch(() => null);
-                  } catch (jevErr) {
-                    if (jevErr instanceof FunctionError && jevErr.status === 429) {
-                      setDailyCapped(true);
-                    }
-                    // Finish without Jev
-                    await finishRunDirect(run.id, run.transcript, run.world, result.checker || { success: false, violations: [] }, task.checker_templates);
-                  }
                 }
-                usingLiveAgents = true;
-              } catch (agentErr) {
-                if (agentErr instanceof FunctionError) {
-                  if (agentErr.status === 429) {
-                    setDailyCapped(true);
-                    throw agentErr;
-                  }
-                  if (agentErr.status === 503) {
-                    // No API key — use mock contender
-                    usingMock = true;
-                    break;
-                  }
-                }
+              }
+            } catch (agentErr) {
+              if (agentErr instanceof FunctionError && agentErr.status === 429) {
+                setDailyCapped(true);
                 throw agentErr;
               }
+              // No API key (503) or agent unavailable — use mock contenders
+              usingMock = true;
+              setRunStatus((prev) => ({
+                ...prev,
+                [task.id]: { state: "running", message: "Using mock contenders...", runIds: createdRunIds },
+              }));
             }
-          } catch (err) {
-            if (err instanceof FunctionError && err.status === 429) {
-              setDailyCapped(true);
-              throw err;
-            }
-            usingMock = true;
-            break;
           }
-        }
 
-        if (usingMock) {
-          // Use mock contenders
-          createdRunIds.length = 0;
-          setRunStatus((prev) => ({
-            ...prev,
-            [task.id]: { state: "running", message: "Using mock contenders...", runIds: [] },
-          }));
+          if (!agentDone) {
+            await runMockDirect(run.id);
+          }
 
-          for (const contender of contenders) {
-            const mockStyle = contender.style === "Careful" ? "Careful" : "Rashy";
-            const { transcript, world } = runMockContender(task, mockStyle as "Careful" | "Rashy");
-            const checker = runCheckersFrontend(task.checker_templates, world, transcript);
-
-            const run = await createRunDirect(task.id, contender.id);
-            createdRunIds.push(run.id);
-
-            // Try Jev grading
+          // Grade with Jev (graded and scored server side), or finish without it
+          if (jevAvailable) {
+            setRunStatus((prev) => ({
+              ...prev,
+              [task.id]: { state: "grading", message: `${contenderName}: grading with Jev...`, runIds: createdRunIds },
+            }));
             try {
-              await finalizeRunDirect(run.id, transcript, world, checker);
-              const jevResult = await callJevGrade(run.id);
-              await scoreRunDirect(run.id, jevResult.jev, checker, task.checker_templates);
+              await callJevGrade(run.id);
+              continue;
             } catch (jevErr) {
               if (jevErr instanceof FunctionError && jevErr.status === 429) {
                 setDailyCapped(true);
               }
-              await finishRunDirect(run.id, transcript, world, checker, task.checker_templates);
+              if (jevErr instanceof FunctionError && (jevErr.status === 429 || jevErr.status === 503)) {
+                jevAvailable = false;
+              }
             }
           }
+          await finishRunDirect(run.id);
         }
 
         setRunStatus((prev) => ({
@@ -188,6 +140,7 @@ export function TasksPage({
         onRunComplete();
       } catch (err) {
         if (err instanceof FunctionError && err.status === 429) {
+          setDailyCapped(true);
           setRunStatus((prev) => ({
             ...prev,
             [task.id]: { state: "error", message: "Daily limit reached — browse past runs" },

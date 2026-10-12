@@ -1,70 +1,96 @@
 // jev-grade: Calls TypeSafe AI's Jev model to grade a finished run's transcript.
-// One batched request per run with every rubric question.
+// Only a run_id is accepted: instruction, constraints and the condensed transcript are
+// built server side from the stored run. Each run is graded at most once; the grade and
+// the scores derived from it are written here (never taken from the client).
+// One batched request per run with every rubric question, max 2 attempts, each counted.
 // Cost = input_tokens * 0.042 / 1_000_000 USD (output tokens free).
 
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
-import { condenseTranscript } from "../_shared/sandbox/scoring.ts";
-import type { Transcript, JevResult } from "../_shared/sandbox/types.ts";
+import { runCheckers } from "../_shared/sandbox/checkers.ts";
+import { JEV_QUESTIONS, condenseTranscript, scoreRun } from "../_shared/sandbox/scoring.ts";
+import { clampDeep, clampString, normalizeStringList, normalizeTranscript, normalizeWorld } from "../_shared/sandbox/guards.ts";
+import type { JevAnswer, JevResult } from "../_shared/sandbox/types.ts";
+import {
+  errorResponse,
+  getServiceClient,
+  isUuid,
+  jsonError,
+  jsonResponse,
+  preflight,
+  readJsonBody,
+  readTextCapped,
+} from "../_shared/http.ts";
+import { paidFetch } from "../_shared/usage.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
-};
-
-const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const supabase = createClient(supabaseUrl, serviceRoleKey, {
-  auth: { persistSession: false },
-});
-
-const DAILY_LIMIT = 200;
+const MAX_BODY_BYTES = 4 * 1024;
+const MAX_JEV_RESPONSE_BYTES = 256 * 1024;
+const JEV_TIMEOUT_MS = 30_000;
 const TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone";
 const JEV_MODEL = "jev-1.13.0";
 const COST_PER_INPUT_TOKEN = 0.042 / 1_000_000;
 
+interface StoredRun {
+  id: string;
+  status: string;
+  jev: unknown;
+  transcript: unknown;
+  world: unknown;
+  task: { instruction: unknown; constraints: unknown; checker_templates: unknown } | null;
+}
+
 Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 200, headers: corsHeaders });
-  }
+  if (req.method === "OPTIONS") return preflight();
+  if (req.method !== "POST") return jsonError(405, "method_not_allowed");
+
+  const supabase = getServiceClient();
+  if (!supabase) return jsonError(503, "server_not_configured");
 
   try {
-    const { run_id } = await req.json();
-    if (!run_id) return jsonError(400, "run_id is required");
+    const body = await readJsonBody(req, MAX_BODY_BYTES);
+    const runId = body.run_id;
+    if (!isUuid(runId)) return jsonError(400, "run_id is required");
 
-    // Check daily cap
-    const { data: allowed, error: bumpErr } = await supabase.rpc("bump_usage", {
-      fn: "jev-grade",
-      lim: DAILY_LIMIT,
-    });
-    if (bumpErr || !allowed) {
-      return jsonError(429, "daily_cap");
+    const { data, error: runErr } = await supabase
+      .from("runs")
+      .select("id, status, jev, transcript, world, task:tasks(instruction, constraints, checker_templates)")
+      .eq("id", runId)
+      .maybeSingle();
+    if (runErr) {
+      console.error("jev-grade: failed to load run:", runErr.message);
+      return jsonError(500, "run_load_failed");
     }
+    const run = data as unknown as StoredRun | null;
+    if (!run || !run.task) return jsonError(404, "Run not found");
+
+    // Grade once, and only runs whose agent has finished.
+    if (hasJev(run.jev) || run.status !== "graded_pending") return jsonError(409, "already_graded_or_not_ready");
 
     const apiKey = Deno.env.get("TYPESAFE_API_KEY");
-    if (!apiKey) {
-      return jsonError(503, "no_typesafe_key");
-    }
+    if (!apiKey) return jsonError(503, "no_typesafe_key");
 
-    // Load run with task
-    const { data: run, error: runErr } = await supabase
+    // Claim the run so concurrent requests can't grade it twice. A claimed run that
+    // fails to grade is finished without Jev via bench-api "finish".
+    const { data: claimed, error: claimErr } = await supabase
       .from("runs")
-      .select("*, task:tasks(*)")
-      .eq("id", run_id)
-      .maybeSingle();
+      .update({ status: "grading" })
+      .eq("id", run.id)
+      .eq("status", "graded_pending")
+      .select("id");
+    if (claimErr) {
+      console.error("jev-grade: failed to claim run:", claimErr.message);
+      return jsonError(500, "run_save_failed");
+    }
+    if (!claimed || claimed.length === 0) return jsonError(409, "already_graded_or_not_ready");
 
-    if (runErr || !run) return jsonError(404, "Run not found");
-
-    const transcript = run.transcript as Transcript;
-    const task = run.task;
-    const condensed = condenseTranscript(transcript);
+    const transcript = normalizeTranscript(run.transcript);
+    const world = normalizeWorld(run.world);
+    const templates = normalizeStringList(run.task.checker_templates, 10, 300);
 
     const requestBody = {
       model: JEV_MODEL,
       state: {
-        instruction: task.instruction,
-        constraints: task.constraints,
-        transcript: condensed,
+        instruction: clampString(typeof run.task.instruction === "string" ? run.task.instruction : "", 1000),
+        constraints: normalizeStringList(run.task.constraints, 10, 200),
+        transcript: condenseTranscript(transcript),
       },
       questions: {
         completed: {
@@ -125,82 +151,101 @@ Deno.serve(async (req: Request) => {
       },
     };
 
-    // Call with retry on 429/529
-    let response: Response | null = null;
-    let lastError = "";
-    let requestStart = Date.now();
-    let latency = 0;
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      requestStart = Date.now();
-      response = await fetch(TYPESAFE_URL, {
+    // Max 2 attempts (retry on 429/529/network only), each counted; stops on daily_cap.
+    const upstream = await paidFetch({
+      supabase,
+      fn: "jev-grade",
+      url: TYPESAFE_URL,
+      init: {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify(requestBody),
-      });
-      latency = Date.now() - requestStart;
+      },
+      timeoutMs: JEV_TIMEOUT_MS,
+    });
+    if (upstream.kind === "capped") return jsonError(upstream.status, upstream.error);
+    if (upstream.kind === "failed") return jsonError(502, "upstream_error");
 
-      if (response.status === 429 || response.status === 529) {
-        lastError = `Status ${response.status}`;
-        if (attempt < 2) {
-          const delay = Math.pow(2, attempt) * 1000;
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          continue;
-        }
-      }
-
-      if (!response.ok) {
-        lastError = await response.text();
-        if (attempt < 2 && (response.status === 429 || response.status === 529)) {
-          continue;
-        }
-      }
-
-      break;
+    let jevData: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(await readTextCapped(upstream.response, MAX_JEV_RESPONSE_BYTES));
+      if (!parsed || typeof parsed !== "object") throw new Error("not an object");
+      jevData = parsed as Record<string, unknown>;
+    } catch (err) {
+      console.error("jev-grade: unreadable Jev response:", String(err));
+      return jsonError(502, "upstream_error");
     }
 
-    if (!response || !response.ok) {
-      return jsonError(502, `Jev API error: ${lastError.substring(0, 200)}`);
-    }
-
-    const data = await response.json();
-    const model = data.model || JEV_MODEL;
-    const usage = data.usage || { input_tokens: 0, output_tokens: 0 };
-
+    const model = typeof jevData.model === "string" ? clampString(jevData.model, 64) : JEV_MODEL;
+    const rawUsage = (jevData.usage ?? {}) as Record<string, unknown>;
+    const usage = {
+      input_tokens: tokenCount(rawUsage.input_tokens),
+      output_tokens: tokenCount(rawUsage.output_tokens),
+    };
     const costUsd = Math.round(usage.input_tokens * COST_PER_INPUT_TOKEN * 100000) / 100000;
 
     console.log(`Jev response model: ${model}`);
 
     const jevResult: JevResult = {
-      answers: data.answers || data.questions || {},
+      answers: pickAnswers(jevData.answers ?? jevData.questions),
       model,
       usage,
-      latency_ms: latency,
+      latency_ms: upstream.latencyMs,
       cost_usd: costUsd,
     };
 
+    const checker = runCheckers(templates, world, transcript);
+    const score = scoreRun(checker, jevResult, templates);
+
+    const { data: saved, error: saveErr } = await supabase
+      .from("runs")
+      .update({
+        jev: jevResult,
+        checker,
+        completion: score.completion,
+        trust: score.trust,
+        overall: score.overall,
+        jev_agrees: score.jev_agrees,
+        cost_usd: costUsd,
+        status: "completed",
+      })
+      .eq("id", run.id)
+      .eq("status", "grading")
+      .select("id");
+    if (saveErr) {
+      console.error("jev-grade: failed to save grade:", saveErr.message);
+      return jsonError(500, "run_save_failed");
+    }
+    if (!saved || saved.length === 0) return jsonError(409, "already_graded_or_not_ready");
+
     return jsonResponse({
-      run_id,
+      run_id: run.id,
       jev: jevResult,
     });
   } catch (err) {
-    return jsonError(500, err.message || "Internal server error");
+    return errorResponse(err);
   }
 });
 
-function jsonResponse(data: unknown, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+function hasJev(jev: unknown): boolean {
+  return !!jev && typeof jev === "object" && Object.keys(jev).length > 0;
 }
 
-function jsonError(status: number, message: string) {
-  return new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+function tokenCount(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+}
+
+// Keep only the rubric questions we asked, with bounded content.
+function pickAnswers(raw: unknown): Record<string, JevAnswer> {
+  const out: Record<string, JevAnswer> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const src = raw as Record<string, unknown>;
+  for (const key of JEV_QUESTIONS) {
+    const answer = clampDeep(src[key], 500);
+    if (answer && typeof answer === "object" && !Array.isArray(answer)) out[key] = answer as unknown as JevAnswer;
+  }
+  return out;
 }

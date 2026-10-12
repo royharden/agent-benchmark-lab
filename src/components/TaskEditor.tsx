@@ -5,6 +5,12 @@ import { CHECKER_LIBRARY as CHECKER_LIB } from "@/types";
 import { createTaskDirect } from "@/lib/supabase";
 import { CATEGORIES, DIFFICULTIES } from "@/types";
 
+// Mirrors the limits bench-api enforces on saved tasks.
+const MAX_TITLE = 120;
+const MAX_INSTRUCTION = 1000;
+const MAX_CONSTRAINT = 200;
+const MAX_CONSTRAINTS = 10;
+
 interface TaskEditorProps {
   task: Task | null;
   onSave: () => void;
@@ -59,7 +65,7 @@ export function TaskEditor({ task, onSave, onCancel }: TaskEditorProps) {
   };
 
   const addConstraint = () => {
-    if (newConstraint.trim()) {
+    if (newConstraint.trim() && constraints.length < MAX_CONSTRAINTS) {
       setConstraints([...constraints, newConstraint.trim()]);
       setNewConstraint("");
     }
@@ -108,6 +114,7 @@ export function TaskEditor({ task, onSave, onCancel }: TaskEditorProps) {
           <input
             type="text"
             value={title}
+            maxLength={MAX_TITLE}
             onChange={(e) => setTitle(e.target.value)}
             placeholder="e.g. Book a flight to Denver"
             className="w-full px-3 py-2.5 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-teal-500"
@@ -147,6 +154,7 @@ export function TaskEditor({ task, onSave, onCancel }: TaskEditorProps) {
           <label className="text-sm font-medium text-gray-700 block mb-1.5">User Instruction</label>
           <textarea
             value={instruction}
+            maxLength={MAX_INSTRUCTION}
             onChange={(e) => setInstruction(e.target.value)}
             rows={3}
             placeholder="e.g. Book me a nonstop flight to Denver under $300 next Friday."
@@ -161,6 +169,7 @@ export function TaskEditor({ task, onSave, onCancel }: TaskEditorProps) {
             <input
               type="text"
               value={newConstraint}
+              maxLength={MAX_CONSTRAINT}
               onChange={(e) => setNewConstraint(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && addConstraint()}
               placeholder="e.g. price <= 300"
