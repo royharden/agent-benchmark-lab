@@ -94,7 +94,8 @@ export const CHECKERS: Record<string, CheckerFn> = {
     return ok();
   },
 
-  no_conflict: (world, _transcript) => {
+  no_conflict: (world, transcript) => {
+    void transcript;
     // Check if any added calendar event conflicts with existing events
     const addedEvents = world.calendar_events;
     // We don't have the original calendar here, but we can check overlaps among added events

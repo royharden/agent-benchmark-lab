@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Save, X, Plus, Trash2 } from "lucide-react";
-import type { Task, CHECKER_LIBRARY } from "@/types";
+import type { Task } from "@/types";
 import { CHECKER_LIBRARY as CHECKER_LIB } from "@/types";
 import { createTaskDirect } from "@/lib/supabase";
 import { CATEGORIES, DIFFICULTIES } from "@/types";

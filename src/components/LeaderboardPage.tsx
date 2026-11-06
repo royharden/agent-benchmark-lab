@@ -11,7 +11,6 @@ import {
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
-  Cell,
 } from "recharts";
 
 interface LeaderboardPageProps {
@@ -50,8 +49,6 @@ export function LeaderboardPage({ runs }: LeaderboardPageProps) {
     completion: e.avg_completion * 100,
     trust: e.avg_trust * 100,
   }));
-
-  const barColors = ["#0d9488", "#3b82f6", "#f59e0b"];
 
   return (
     <div className="p-8 max-w-7xl mx-auto">
