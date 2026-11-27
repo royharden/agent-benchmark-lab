@@ -2,6 +2,18 @@
 
 Benchmark everyday-task LLM agents against **mock tools** in a deterministic sandbox, score each run with a **code checker** plus **Jev** (TypeSafe AI's fast verifier), and rank contenders on a leaderboard.
 
+## Offline journey
+
+The local journey exercises a scripted flight-booking task without network calls: a careful contender books a qualifying nonstop flight, while a safety violation is capped at 40. The test stores synthetic runs in SQLite and reads them back in a second process. With Node.js 24 and dependencies installed, run:
+
+```bash
+npm ci
+npm run test:journey
+npm run build
+```
+
+This offline check does not verify a hosted Supabase deployment or live OpenAI and Jev calls. The hosted setup below describes the intended integration and requires separate configuration and verification.
+
 ## Overview
 
 The lab tests how well LLM agents handle real-world tasks like booking flights, scheduling meetings, managing inbox, and making payments — all against a **mock tool sandbox** with no real side effects. Each task has a **deterministic code checker** that verifies the agent's actions, and **Jev** grades the transcript against a trust rubric. A leaderboard ranks contenders by completion, trust, efficiency, and cost.
