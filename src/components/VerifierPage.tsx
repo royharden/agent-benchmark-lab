@@ -3,17 +3,11 @@ import { ShieldCheck, AlertCircle, ThumbsUp, ThumbsDown } from "lucide-react";
 import type { VerifierData } from "@/types";
 import { fetchVerifierDataDirect } from "@/lib/supabase";
 import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
   Tooltip,
   ResponsiveContainer,
   Cell,
   PieChart,
   Pie,
-  Legend,
 } from "recharts";
 
 export function VerifierPage() {
@@ -60,13 +54,6 @@ export function VerifierPage() {
   }
 
   const agreementPct = (data.agreement_rate * 100).toFixed(1);
-
-  const confusionData = [
-    { name: "Both agree: PASS", value: data.confusion_matrix.tt, fill: "#10b981" },
-    { name: "Checker FAIL, Jev says PASS", value: data.confusion_matrix.ft, fill: "#ef4444" },
-    { name: "Checker PASS, Jev says FAIL", value: data.confusion_matrix.tf, fill: "#f59e0b" },
-    { name: "Both agree: FAIL", value: data.confusion_matrix.ff, fill: "#6b7280" },
-  ].filter((d) => d.value > 0);
 
   const summaryData = [
     { name: "Agree", value: data.agrees, fill: "#10b981" },

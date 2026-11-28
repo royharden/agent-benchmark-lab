@@ -1,6 +1,5 @@
 import { useState } from "react";
 import {
-  ChevronRight,
   CheckCircle2,
   XCircle,
   AlertTriangle,

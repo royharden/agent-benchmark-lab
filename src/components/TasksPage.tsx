@@ -55,7 +55,6 @@ export function TasksPage({
   const [runningTaskId, setRunningTaskId] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<Record<string, { state: RunState; message?: string; runIds?: string[] }>>({});
   const [filterCategory, setFilterCategory] = useState<string>("all");
-  const [expandedTask, setExpandedTask] = useState<string | null>(null);
 
   const filteredTasks = filterCategory === "all" ? tasks : tasks.filter((t) => t.category === filterCategory);
 
